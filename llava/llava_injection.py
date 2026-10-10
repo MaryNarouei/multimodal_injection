@@ -25,6 +25,23 @@ import json
 import numpy as np
 from llava.model.llava import LlavaLlamaModel
 
+try:
+    from IPython.display import display
+except ImportError:  # running as a plain script
+    display = print
+
+
+# CLIP normalization constants. A pixel in [0, 1] maps to [(0-m)/s, (1-m)/s].
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def clamp_to_valid_pixels(X):
+    """Clamp a normalized image tensor to values that are real pixels."""
+    m = torch.tensor(CLIP_MEAN, device=X.device, dtype=X.dtype).view(1, 3, 1, 1)
+    s = torch.tensor(CLIP_STD, device=X.device, dtype=X.dtype).view(1, 3, 1, 1)
+    return torch.max(torch.min(X, (1 - m) / s), (0 - m) / s)
+
 
 TEMPERATURE = 0.7
 MAX_NEW_TOKENS = 256
@@ -232,7 +249,7 @@ def train_image_entire(
                 (
                     cur_input_embeds[: image_start_token_pos + 1],
                     cur_image_features,
-                    cur_input_embeds[image_start_token_pos + 256 + 1 :],
+                    cur_input_embeds[image_start_token_pos + num_patches + 1 :],
                 ),
                 dim=0,
             )
@@ -250,7 +267,7 @@ def train_image_entire(
             X = X - lr * res3[0].sign()
 
             # Decide how to clamp
-            X = torch.clamp(X, min=-1.8, max=2.2)
+            X = clamp_to_valid_pixels(X)
             del res, res2, res3
 
         scheduler.step()
@@ -308,7 +325,7 @@ def train_image_partial(
                 (
                     cur_input_embeds[: image_start_token_pos + 1],
                     cur_image_features,
-                    cur_input_embeds[image_start_token_pos + 256 + 1 :],
+                    cur_input_embeds[image_start_token_pos + num_patches + 1 :],
                 ),
                 dim=0,
             )
@@ -326,20 +343,23 @@ def train_image_partial(
             part_to_modify = part_to_modify - lr * res3[0].sign()
 
             # Decide how to clamp
-            part_to_modify = torch.clamp(part_to_modify, min=-1.8, max=2.2)
+            part_to_modify = clamp_to_valid_pixels(part_to_modify)
             del res, res2, res3
 
             # pbar.set_postfix({'loss': loss.item(), 'word': j})
         scheduler.step()
         pbar.set_postfix({"loss": np.mean(loss_acc), "lr": scheduler.get_last_lr()[0]})
 
-    return modified_X
+    # modified_X was built before the last update; rebuild it from the final part.
+    return torch.cat((part_to_modify, remaining_part), dim=2)
 
 
 def save_image(X, unnorm, name="test"):
-    ## save image to .png
-    # save_img_path = "result_images/llava/" + name + ".png"
-    # torchvision.utils.save_image(unnorm(X.data[0].detach().cpu()), save_img_path)
+    os.makedirs("result_images/llava", exist_ok=True)
+
+    # save image to .png (the file an attacker would actually share)
+    save_img_path = "result_images/llava/" + name + ".png"
+    torchvision.utils.save_image(unnorm(X.data[0].detach().float().cpu()), save_img_path)
 
     # save the image tensor to .pt
     save_pt_path = "result_images/llava/" + name + ".pt"
@@ -409,9 +429,14 @@ def generate_stream(model, prompt, tokenizer, input_ids, images=None):
         else:
             stopped = False
 
+        # LLaVA-v0 separates turns with "###". Stop there so the model
+        # does not write fake "###Human:" turns into the dialog history.
+        cur_out = tokenizer.decode(pred_ids, skip_special_tokens=True)
+        if "###" in cur_out:
+            stopped = True
+
         if i != 0 and i % 1024 == 0 or i == max_new_tokens - 1 or stopped:
-            cur_out = tokenizer.decode(pred_ids, skip_special_tokens=True)
-            pos = -1  # cur_out.rfind(stop_str)
+            pos = cur_out.find("###")
             if pos != -1:
                 cur_out = cur_out[:pos]
                 stopped = True
